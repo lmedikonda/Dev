@@ -11,39 +11,330 @@ before_script:
 
     - sfdx --version
     - sfdx plugins --core
+    
+variables:
+  GIT_DEPTH: 0
 #
 # Define the stages of our pipeline
 #
 stages:
     - validation
-    - integration-testing
-    - app-deploy
+    - deploy-ci
+    - deploy-uat
+    - deploy-production
+    - test-gitlabci
 #
-# Stage 1 -- Create a scratch org for code testing
+# Stage 1 -- Validate code chanages against DeployTest Sandbox
 #
 validation:
     stage: validation
-    when: manual
+    #rules: supported gitlab 12.3 onwards
+    #- if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "ip-deploytest"'
+    only:
+     - merge_requests
+     
     script:
-        # Authenticate to the Dev Hub using the server key
+
+        - echo CI_COMMIT_REF_NAME=${CI_COMMIT_REF_NAME}
+        - echo CI_MERGE_REQUEST_SOURCE_BRANCH_SHA=${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA}
+        - echo CI_MERGE_REQUEST_TARGET_BRANCH_SHA=${CI_MERGE_REQUEST_TARGET_BRANCH_SHA}
+        - echo CI_MERGE_REQUEST_SOURCE_BRANCH_NAME=${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}
+        - echo CI_MERGE_REQUEST_TARGET_BRANCH_NAME=${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}
+        
+        - echo $CI_MERGE_REQUEST_TITLE
+        - echo $CI_COMMIT_DESCRIPTION
+        - echo $CI_COMMIT_MESSAGE
+        - echo CI_COMMIT_TITLE=${CI_COMMIT_TITLE}
+        - testlevels="NoTestRun"
+        - echo $CI_MERGE_REQUEST_TITLE
+        - echo $CI_MERGE_REQUEST_IID
+        - response=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/merge_requests/$CI_MERGE_REQUEST_IID")
+        - title=$(echo $response | jq '.title')
+        - title=$(echo "$title" | tr -d '"')
+        - echo $title
+
+        - >
+          if [ $title == "TestLevels" ]; then
+            description=$(echo $response | jq '.description')
+            description=$(echo "$description" | tr -d '"')
+            echo $description
+            testlevels="RunSpecifiedTests -r "$description,
+          fi
+        - echo $testlevels
+        - files=$(git diff --diff-filter=d --name-only origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} origin/${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME})
+        #- files=$(git diff-tree --no-commit-id --name-only -r ${CI_COMMIT_SHA})
+        - echo $files
+        - git log -1 --pretty=%B
+        - >
+          for f in ${files}; do
+            if [[ $f == *"force-app"* ]]; then
+                components+=','
+                components+="$f"
+            fi
+          done
+        - components=$(echo ${components/,/ })      
+        - echo $components
+        - username=""
+        - consumerKey=""
+        - instanceUrl=""
+        
+        - >
+          if [ ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} == "staging" ]; then
+            username=$SF_UAT_USERNAME
+            consumerKey=$SF_UAT_CONSUMER_KEY
+            instanceUrl="https://test.salesforce.com"
+            
+          elif [ ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} == "master" ]; then
+            username=$SF_USERNAME
+            consumerKey=$SF_CONSUMER_KEY 
+            instanceUrl="https://login.salesforce.com"
+          else
+            username=$SF_CI_USERNAME
+            consumerKey=$SF_CI_CONSUMER_KEY
+            instanceUrl="https://test.salesforce.com"
+          fi
+          
+        - sfdx force:auth:jwt:grant --setdefaultusername --clientid $consumerKey --jwtkeyfile assets/server.key --username $username --instanceurl $instanceUrl
+
+        - sfdx force:config:set restDeploy=true
+        - sfdx force:config:set defaultusername=$username
+        - sfdx force:org:display
+        - >
+          if [ ! -z "$components" ]; then
+            sfdx force:source:deploy --sourcepath $components -l $testlevels -c --targetusername $username
+          else
+            echo "No components to deploy"
+          fi
+        #- sfdx force:source:deploy --sourcepath $components -l RunSpecifiedTests -r $CI_COMMIT_DESCRIPTION  -c --targetusername $username
+        
+test-gitlabci:
+    stage: test-gitlabci
+    only:
+     - Test_CI
+     
+    script:
+
+        - sfdx force:auth:jwt:grant --setdefaultusername --clientid $SF_CI_CONSUMER_KEY --jwtkeyfile assets/server.key --username $SF_CI_USERNAME --instanceurl https://test.salesforce.com
+        - sfdx force:config:set restDeploy=true
+        - sfdx force:config:set defaultusername=$SF_CI_USERNAME
+        - files=$(git diff --diff-filter=d --name-only ${CI_COMMIT_BEFORE_SHA}...${CI_COMMIT_SHA})
+        - echo $CI_COMMIT_SHA
+        - echo $CI_COMMIT_BEFORE_SHA
+        - echo $CI_MERGE_REQUEST_SOURCE_BRANCH_SHA
+        - echo $files
+        - >
+          for f in ${files}; do
+            if [[ $f == *"force-app"* ]]; then
+                components+=','
+                components+="$f"
+            fi
+          done
+        - components=$(echo ${components/,/ })      
+        - echo $components
+        - revert="false"
+        - testlevels="NoTestRun"
+        - response=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/repository/commits/$CI_COMMIT_SHA")
+        - message=$(echo $response | jq '.message')
+        - message=$(echo $message | rev | cut -d'!' -f1 | rev)
+        - mergerequest=$(echo $message | tr -d -c 0-9)
+        - mresponse=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/merge_requests/$mergerequest")
+        - title=$(echo $mresponse | jq '.title')
+        - title=$(echo "$title" | tr -d '"')
+        - echo $title
+
+        - >
+          if [ $title == "TestLevels" ]; then
+            description=$(echo $mresponse | jq '.description')
+            description=$(echo "$description" | tr -d '"')
+            echo $description
+            testlevels="RunSpecifiedTests -r "$description,
+          fi
+        - echo $testlevels
+        - sfdx force:org:display
+        - >
+          if [ ! -z "$components" ]; then
+            sfdx force:source:deploy --sourcepath $components -l $testlevels  --targetusername $SF_CI_USERNAME || revert="true"
+          else
+            echo "No components to deploy"
+          fi
+        - >
+          if [ $revert == "true" ]; then 
+            git revert -m 1 ${CI_COMMIT_SHA}
+            git remote set-url origin https://gitlab-ci-token:$ACCESS_TOKEN@gitlab.com/InsightPartners/go-platform/insight-salesforce-org.git
+            git push origin HEAD:ip-deploytest
+          fi
+
+#
+# Stage 2 -- Deploy commit changes from ip-deploytest branch to Deploytest sandbox
+#
+deploy-ci:
+    stage: deploy-ci
+    only:
+     - ip-deploytest
+     
+    script:
+
+        - sfdx force:auth:jwt:grant --setdefaultusername --clientid $SF_CI_CONSUMER_KEY --jwtkeyfile assets/server.key --username $SF_CI_USERNAME --instanceurl https://test.salesforce.com
+        - sfdx force:config:set restDeploy=true
+        - sfdx force:config:set defaultusername=$SF_CI_USERNAME
+        - files=$(git diff --diff-filter=d --name-only ${CI_COMMIT_BEFORE_SHA}...${CI_COMMIT_SHA})
+        - echo $files
+        - >
+          for f in ${files}; do
+            if [[ $f == *"force-app"* ]]; then
+                components+=','
+                components+="$f"
+            fi
+          done
+        - components=$(echo ${components/,/ })      
+        - echo $components
+        - revert="false"
+        - testlevels="NoTestRun"
+        - response=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/repository/commits/$CI_COMMIT_SHA")
+        - message=$(echo $response | jq '.message')
+        - message=$(echo $message | rev | cut -d'!' -f1 | rev)
+        - mergerequest=$(echo $message | tr -d -c 0-9)
+        - mresponse=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/merge_requests/$mergerequest")
+        - title=$(echo $mresponse | jq '.title')
+        - title=$(echo "$title" | tr -d '"')
+        - echo $title
+
+        - >
+          if [ $title == "TestLevels" ]; then
+            description=$(echo $mresponse | jq '.description')
+            description=$(echo "$description" | tr -d '"')
+            echo $description
+            testlevels="RunSpecifiedTests -r "$description,
+          fi
+        - echo $testlevels
+        - sfdx force:org:display
+        - >
+          if [ ! -z "$components" ]; then
+            sfdx force:source:deploy --sourcepath $components -l $testlevels  --targetusername $SF_CI_USERNAME || revert="true"
+          else
+            echo "No components to deploy"
+          fi
+        - >
+          if [ $revert == "true" ]; then 
+            git revert -m 1 ${CI_COMMIT_SHA}
+            git remote set-url origin https://gitlab-ci-token:$ACCESS_TOKEN@gitlab.com/InsightPartners/go-platform/insight-salesforce-org.git
+            git push origin HEAD:ip-deploytest
+          fi
+
+    
+#
+# Stage 3 -- Deploy commit changes from staging branch to fullcopy sandbox
+#
+deploy-uat:
+    stage: deploy-uat
+    only:
+     - staging
+     
+    script:
 
         #- sfdx force:auth:jwt:grant --setdefaultdevhubusername --setalias DevHub --clientid $SF_CONSUMER_KEY --jwtkeyfile assets/server.key --username $SF_USERNAME
-        - sfdx force:auth:jwt:grant --clientid 3MVG9Oe7T3Ol0ea6If.Q8PidWvzWGH8jAc2ibBnIhV_C0ohx9Nj0YZlA6mrEfaEZfOC5ySuWMTHMv332leiFF --jwtkeyfile assets/server.key --username jhoskins@insightpartners.com.fullcopy --instanceurl https://test.salesforce.com
-        #- sfdx force:org:create --setdefaultusername --definitionfile config/project-scratch-def.json --targetdevhubusername $SF_USERNAME --wait 10 --durationdays 7
-        #- sfdx force:org:display
-        # Push source to scratch org (this is with source code, all files, etc)
+        - sfdx force:auth:jwt:grant --setdefaultusername --clientid $SF_UAT_CONSUMER_KEY --jwtkeyfile assets/server.key --username $SF_UAT_USERNAME --instanceurl https://test.salesforce.com
         - sfdx force:config:set restDeploy=true
-        #- sfdx force:source:deploy -x manifest/package.xml --checkonly --targetusername jhoskins@insightpartners.com.fullcopy --runtests RunLocalTests
-        - sfdx force:source:deploy --sourcepath force-app -l RunLocalTests -c --targetusername jhoskins@insightpartners.com.fullcopy
+        - sfdx force:config:set defaultusername=$SF_UAT_USERNAME
+        - files=$(git diff --diff-filter=d --name-only ${CI_COMMIT_BEFORE_SHA}...${CI_COMMIT_SHA})
+        - echo $files
+        - >
+          for f in ${files}; do
+            if [[ $f == *"force-app"* ]]; then
+                components+=','
+                components+="$f"
+            fi
+          done
+        - components=$(echo ${components/,/ })      
+        - echo $components
+        - revert="false"
+        - testlevels="NoTestRun"
+        - response=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/repository/commits/$CI_COMMIT_SHA")
+        - message=$(echo $response | jq '.message')
+        - message=$(echo $message | rev | cut -d'!' -f1 | rev)
+        - mergerequest=$(echo $message | tr -d -c 0-9)
+        - mresponse=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/merge_requests/$mergerequest")
+        - title=$(echo $mresponse | jq '.title')
+        - title=$(echo "$title" | tr -d '"')
+        - echo $title
 
-        # Unit Testing
-        # - sfdx force:apex:test:run --wait 10 --resultformat human --codecoverage --testlevel RunLocalTests
-        # Delete Scratch Org
-        #- sfdx force:org:delete --noprompt
-#
-# Stage 2 -- Create a scratch org, create a package version, and push into org for testing
-#
+        - >
+          if [ $title == "TestLevels" ]; then
+            description=$(echo $mresponse | jq '.description')
+            description=$(echo "$description" | tr -d '"')
+            echo $description
+            testlevels="RunSpecifiedTests -r "$description,
+          fi
+        - echo $testlevels
+        - sfdx force:org:display
+        - >
+          if [ ! -z "$components" ]; then
+            sfdx force:source:deploy --sourcepath $components -l $testlevels --targetusername $SF_UAT_USERNAME || revert="true"
+          else
+            echo "No components to deploy"
+          fi
+        - >
+          if [ $revert == "true" ]; then 
+            git revert -m 1 ${CI_COMMIT_SHA}
+            git remote set-url origin https://gitlab-ci-token:$ACCESS_TOKEN@gitlab.com/InsightPartners/go-platform/insight-salesforce-org.git
+            git push origin HEAD:staging
+          fi
 
 #
-# Stage 3 -- Promote the package to downstream environment for UAT for example
+# Stage 4 -- Deploy commit changes from master branch to prodution
 #
+deploy-production:
+    stage: deploy-production
+    when: manual
+    only:
+     - master
+     
+    script:
+
+        #- sfdx force:auth:jwt:grant --setdefaultdevhubusername --setalias DevHub --clientid $SF_CONSUMER_KEY --jwtkeyfile assets/server.key --username $SF_USERNAME
+        - sfdx force:auth:jwt:grant --setdefaultusername --clientid $SF_CONSUMER_KEY --jwtkeyfile assets/server.key --username $SF_USERNAME --instanceurl https://login.salesforce.com
+        - sfdx force:config:set restDeploy=true
+        - sfdx force:config:set defaultusername=$SF_USERNAME
+        - files=$(git diff --diff-filter=d --name-only ${CI_COMMIT_BEFORE_SHA}...${CI_COMMIT_SHA})
+        - echo $files
+        - >
+          for f in ${files}; do
+            if [[ $f == *"force-app"* ]]; then
+                components+=','
+                components+="$f"
+            fi
+          done
+        - components=$(echo ${components/,/ })      
+        - echo $components
+        - revert="false"
+        - testlevels="RunLocalTests"
+        - response=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/repository/commits/$CI_COMMIT_SHA")
+        - message=$(echo $response | jq '.message')
+        - message=$(echo $message | rev | cut -d'!' -f1 | rev)
+        - mergerequest=$(echo $message | tr -d -c 0-9)
+        - mresponse=$(curl --header "PRIVATE-TOKEN:$ACCESS_TOKEN" "https://gitlab.com/api/v4/projects/24423029/merge_requests/$mergerequest")
+        - title=$(echo $mresponse | jq '.title')
+        - title=$(echo "$title" | tr -d '"')
+        - echo $title
+
+        - >
+          if [ $title == "TestLevels" ]; then
+            description=$(echo $mresponse | jq '.description')
+            description=$(echo "$description" | tr -d '"')
+            echo $description
+            testlevels="RunSpecifiedTests -r "$description,
+          fi
+        - echo $testlevels
+        - sfdx force:org:display
+        - >
+          if [ ! -z "$components" ]; then
+            sfdx force:source:deploy --sourcepath $components -l $testlevels --targetusername $SF_USERNAME || revert="true"
+          else
+            echo "No components to deploy"
+          fi
+        - >
+          if [ $revert == "true" ]; then 
+            git revert -m 1 ${CI_COMMIT_SHA}
+            git remote set-url origin https://gitlab-ci-token:$ACCESS_TOKEN@gitlab.com/InsightPartners/go-platform/insight-salesforce-org.git
+            git push origin HEAD:master
+          fi
